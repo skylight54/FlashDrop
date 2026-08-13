@@ -1,0 +1,2 @@
+magic-wormhole>=0.24.0
+PySide6>=6.11.0

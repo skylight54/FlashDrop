@@ -1,0 +1,596 @@
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+from typing import List, Optional
+
+from PySide6.QtCore import Qt, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QPixmap
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QTabWidget,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+
+from . import __version__
+from .transfer import TransferWorker
+from .updater import UpdateChecker
+
+
+APP_NAME = "即传 FlashDrop"
+
+
+STATE_IMAGES = {
+    "idle": "Idle.webp",
+    "wait": "Waiting.jpg",
+    "success": "Success.jpg",
+    "fail": "Fail.jpg",
+}
+
+
+def asset_dir() -> str:
+    """返回随应用打包或位于项目根目录的 Asset 图片目录。"""
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    else:
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, "Asset")
+
+
+_pixmap_cache: dict = {}
+
+
+def state_pixmap(state: str, size: int = 160):
+    key = (state, size)
+    cached = _pixmap_cache.get(key)
+    if cached is not None:
+        return cached
+    path = os.path.join(asset_dir(), STATE_IMAGES[state])
+    pixmap = QPixmap(path)
+    if pixmap.isNull():
+        return None
+    scaled = pixmap.scaled(
+        size,
+        size,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    _pixmap_cache[key] = scaled
+    return scaled
+
+
+STYLESHEET = """
+QMainWindow, QWidget {
+    background: #f5f6f8;
+    color: #1f2329;
+    font-size: 14px;
+}
+QLabel#tabTitle {
+    font-size: 22px;
+    font-weight: 700;
+}
+QLabel#subtitle {
+    color: #6b7280;
+    font-size: 13px;
+}
+QLabel#codeValue {
+    font-family: Consolas, "Courier New", monospace;
+    font-size: 26px;
+    font-weight: 700;
+    color: #2563eb;
+    background: #eef2ff;
+    border: 1px solid #c7d2fe;
+    border-radius: 6px;
+    padding: 16px;
+}
+QListWidget, QLineEdit, QTextEdit {
+    background: #ffffff;
+    border: 1px solid #d9dce1;
+    border-radius: 6px;
+    padding: 6px;
+}
+QListWidget::item {
+    padding: 6px;
+}
+QListWidget::item:selected {
+    background: #eef2ff;
+    color: #1f2329;
+}
+QPushButton {
+    background: #ffffff;
+    border: 1px solid #d9dce1;
+    border-radius: 6px;
+    padding: 8px 14px;
+}
+QPushButton:hover {
+    background: #f1f3f5;
+}
+QPushButton:disabled {
+    color: #a1a8b0;
+    background: #f1f3f5;
+}
+QPushButton#primary {
+    background: #2563eb;
+    color: #ffffff;
+    border: none;
+    font-weight: 600;
+}
+QPushButton#primary:hover {
+    background: #1d4ed8;
+}
+QPushButton#primary:disabled {
+    background: #a5b8ee;
+}
+QProgressBar {
+    border: none;
+    background: #e5e7eb;
+    border-radius: 5px;
+    height: 8px;
+    text-align: center;
+}
+QProgressBar::chunk {
+    background: #2563eb;
+    border-radius: 5px;
+}
+QTabWidget::pane {
+    border: none;
+}
+QTabBar::tab {
+    background: transparent;
+    padding: 10px 22px;
+    color: #6b7280;
+}
+QTabBar::tab:selected {
+    color: #2563eb;
+    border-bottom: 2px solid #2563eb;
+}
+"""
+
+
+def default_download_dir() -> str:
+    return str(Path.home() / "Downloads")
+
+
+class StateImage(QLabel):
+    """按传输状态显示对应图片的标签。"""
+
+    def __init__(self, state: str = "idle", parent=None):
+        super().__init__(parent)
+        self.setFixedSize(170, 170)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.set_state(state)
+
+    def set_state(self, state: str) -> None:
+        pixmap = state_pixmap(state)
+        if pixmap is not None:
+            self.setPixmap(pixmap)
+        else:
+            self.clear()
+
+
+class _TransferPanel(QFrame):
+    """发送/接收共用的进度展示区域。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("transferPanel")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.log = QTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setFixedHeight(120)
+
+        layout.addWidget(self.status_label)
+        layout.addWidget(self.progress)
+        layout.addWidget(self.log)
+
+    def clear(self) -> None:
+        self.status_label.setText("")
+        self.log.clear()
+
+
+class SendTab(QWidget):
+    busy_changed = Signal(bool)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._files: List[str] = []
+        self._worker: Optional[TransferWorker] = None
+        self._code = ""
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(28, 24, 28, 28)
+        root.setSpacing(14)
+
+        title = QLabel("发送文件")
+        title.setObjectName("tabTitle")
+        subtitle = QLabel("选择文件或文件夹，生成暗号后把暗号告诉对方")
+        subtitle.setObjectName("subtitle")
+
+        self.state_image = StateImage("idle")
+
+        self.file_list = QListWidget()
+        self.file_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+
+        file_buttons = QHBoxLayout()
+        self.add_files_btn = QPushButton("添加文件")
+        self.add_dir_btn = QPushButton("添加文件夹")
+        self.remove_btn = QPushButton("移除选中")
+        self.clear_btn = QPushButton("清空")
+        for button in (self.add_files_btn, self.add_dir_btn, self.remove_btn, self.clear_btn):
+            file_buttons.addWidget(button)
+
+        self.start_btn = QPushButton("开始发送")
+        self.start_btn.setObjectName("primary")
+
+        code_row = QHBoxLayout()
+        self.code_value = QLabel("")
+        self.code_value.setObjectName("codeValue")
+        self.code_value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.code_value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.copy_btn = QPushButton("复制暗号")
+        code_row.addWidget(self.code_value, 1)
+        code_row.addWidget(self.copy_btn)
+
+        self.panel = _TransferPanel()
+        self.panel.progress.setRange(0, 0)
+        self.cancel_btn = QPushButton("取消")
+        self.cancel_btn.hide()
+        self.code_value.hide()
+        self.copy_btn.hide()
+        self.panel.hide()
+
+        root.addWidget(title)
+        root.addWidget(subtitle)
+        root.addWidget(self.state_image, 0, Qt.AlignmentFlag.AlignCenter)
+        root.addWidget(self.file_list, 1)
+        root.addLayout(file_buttons)
+        root.addWidget(self.start_btn)
+        root.addLayout(code_row)
+        root.addWidget(self.panel)
+        root.addWidget(self.cancel_btn)
+
+        self.add_files_btn.clicked.connect(self._add_files)
+        self.add_dir_btn.clicked.connect(self._add_dir)
+        self.remove_btn.clicked.connect(self._remove_selected)
+        self.clear_btn.clicked.connect(self._clear)
+        self.start_btn.clicked.connect(self._start)
+        self.copy_btn.clicked.connect(self._copy_code)
+        self.cancel_btn.clicked.connect(self._cancel)
+
+
+    def _add_files(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(self, "选择要发送的文件", "", "所有文件 (*)")
+        for path in files:
+            if path and path not in self._files:
+                self._files.append(path)
+                self.file_list.addItem(path)
+
+    def _add_dir(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "选择要发送的文件夹", "")
+        if path and path not in self._files:
+            self._files.append(path)
+            self.file_list.addItem(path)
+
+    def _remove_selected(self) -> None:
+        for item in list(self.file_list.selectedItems()):
+            path = item.text()
+            if path in self._files:
+                self._files.remove(path)
+            self.file_list.takeItem(self.file_list.row(item))
+
+    def _clear(self) -> None:
+        self._files.clear()
+        self.file_list.clear()
+
+    def _start(self) -> None:
+        if not self._files:
+            QMessageBox.warning(self, APP_NAME, "请先选择要发送的文件或文件夹。")
+            return
+        args = ["send", "--no-qr", "--hide-progress"] + self._files
+        self._begin_transfer(args, cwd=None)
+
+    def _begin_transfer(self, args: List[str], cwd: Optional[str]) -> None:
+        self._code = ""
+        self.code_value.setText("")
+        self.code_value.show()
+        self.copy_btn.setEnabled(False)
+        self.copy_btn.show()
+        self.panel.show()
+        self.panel.clear()
+        self.panel.status_label.setText("正在准备…")
+        self.cancel_btn.show()
+        self._set_busy(True)
+        self.state_image.set_state("wait")
+
+        self._worker = TransferWorker(args, cwd=cwd, parent=self)
+        self._worker.code_ready.connect(self._on_code_ready)
+        self._worker.status.connect(self._on_status)
+        self._worker.succeeded.connect(self._on_succeeded)
+        self._worker.failed.connect(self._on_failed)
+        self._worker.finished.connect(self._on_finished)
+        self._worker.start()
+
+    def _on_code_ready(self, code: str) -> None:
+        self._code = code
+        self.code_value.setText(code)
+        self.copy_btn.setEnabled(True)
+        self.panel.status_label.setText("等待对方输入暗号…")
+
+    def _on_status(self, text: str) -> None:
+        self.panel.log.appendPlainText(text)
+
+    def _on_succeeded(self, _received_path: str) -> None:
+        self.panel.status_label.setText("发送完成。")
+        self.panel.progress.setRange(0, 1)
+        self.panel.progress.setValue(1)
+        self.state_image.set_state("success")
+
+    def _on_failed(self, message: str) -> None:
+        self.panel.status_label.setText("发送失败。")
+        self.state_image.set_state("fail")
+        QMessageBox.critical(self, APP_NAME, message or "发送失败。")
+
+    def _on_finished(self) -> None:
+        self._set_busy(False)
+        self.cancel_btn.hide()
+        self._worker = None
+
+    def _set_busy(self, busy: bool) -> None:
+        self.file_list.setEnabled(not busy)
+        self.add_files_btn.setEnabled(not busy)
+        self.add_dir_btn.setEnabled(not busy)
+        self.remove_btn.setEnabled(not busy)
+        self.clear_btn.setEnabled(not busy)
+        self.start_btn.setEnabled(not busy)
+        self.busy_changed.emit(busy)
+
+    def _copy_code(self) -> None:
+        if self._code:
+            QApplication.clipboard().setText(self._code)
+            self.panel.status_label.setText("暗号已复制。")
+
+    def _cancel(self) -> None:
+        if self._worker is not None:
+            self._worker.cancel()
+
+
+class ReceiveTab(QWidget):
+    busy_changed = Signal(bool)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._worker: Optional[TransferWorker] = None
+        self._output_dir = default_download_dir()
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(28, 24, 28, 28)
+        root.setSpacing(14)
+
+        title = QLabel("接收文件")
+        title.setObjectName("tabTitle")
+        subtitle = QLabel("输入对方提供的暗号，文件会保存到你选择的位置")
+        subtitle.setObjectName("subtitle")
+
+        self.state_image = StateImage("idle")
+
+        self.code_input = QLineEdit()
+        self.code_input.setPlaceholderText("输入暗号，例如 3-tomorrow-concert")
+
+        dir_label = QLabel("保存位置")
+        dir_label.setObjectName("subtitle")
+        dir_row = QHBoxLayout()
+        self.dir_value = QLabel(self._output_dir)
+        self.dir_value.setWordWrap(True)
+        self.browse_btn = QPushButton("选择位置")
+        dir_row.addWidget(self.dir_value, 1)
+        dir_row.addWidget(self.browse_btn)
+
+        self.start_btn = QPushButton("开始接收")
+        self.start_btn.setObjectName("primary")
+
+        self.panel = _TransferPanel()
+        self.cancel_btn = QPushButton("取消")
+        self.open_btn = QPushButton("打开接收位置")
+        self.cancel_btn.hide()
+        self.open_btn.hide()
+        self.panel.hide()
+
+        root.addWidget(title)
+        root.addWidget(subtitle)
+        root.addWidget(self.state_image, 0, Qt.AlignmentFlag.AlignCenter)
+        root.addWidget(self.code_input)
+        root.addWidget(dir_label)
+        root.addLayout(dir_row)
+        root.addWidget(self.start_btn)
+        root.addWidget(self.panel)
+        root.addWidget(self.cancel_btn)
+        root.addWidget(self.open_btn)
+        root.addStretch(1)
+
+        self.browse_btn.clicked.connect(self._browse)
+        self.start_btn.clicked.connect(self._start)
+        self.cancel_btn.clicked.connect(self._cancel)
+        self.open_btn.clicked.connect(self._open_dir)
+
+
+    def _browse(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "选择保存位置", self._output_dir)
+        if path:
+            self._output_dir = path
+            self.dir_value.setText(path)
+
+    def _start(self) -> None:
+        code = self.code_input.text().strip()
+        if not code:
+            QMessageBox.warning(self, APP_NAME, "请输入暗号。")
+            return
+        if not self._output_dir:
+            QMessageBox.warning(self, APP_NAME, "请选择保存位置。")
+            return
+        os.makedirs(self._output_dir, exist_ok=True)
+        args = ["receive", "--accept-file", "--hide-progress", code]
+        self._begin_transfer(args, cwd=self._output_dir)
+
+    def _begin_transfer(self, args: List[str], cwd: Optional[str]) -> None:
+        self.panel.show()
+        self.panel.clear()
+        self.panel.status_label.setText("正在等待发送方…")
+        self.cancel_btn.show()
+        self.open_btn.hide()
+        self._set_busy(True)
+        self.state_image.set_state("wait")
+
+        self._worker = TransferWorker(args, cwd=cwd, parent=self)
+        self._worker.status.connect(self._on_status)
+        self._worker.succeeded.connect(self._on_succeeded)
+        self._worker.failed.connect(self._on_failed)
+        self._worker.finished.connect(self._on_finished)
+        self._worker.start()
+
+    def _on_status(self, text: str) -> None:
+        self.panel.log.appendPlainText(text)
+
+    def _on_succeeded(self, received_path: str) -> None:
+        self.panel.status_label.setText("接收完成。")
+        self.panel.progress.setRange(0, 1)
+        self.panel.progress.setValue(1)
+        self.state_image.set_state("success")
+        if received_path:
+            self.panel.status_label.setText(f"接收完成：{received_path}")
+        self.open_btn.show()
+
+    def _on_failed(self, message: str) -> None:
+        self.panel.status_label.setText("接收失败。")
+        self.state_image.set_state("fail")
+        QMessageBox.critical(self, APP_NAME, message or "接收失败。")
+
+    def _on_finished(self) -> None:
+        self._set_busy(False)
+        self.cancel_btn.hide()
+        self._worker = None
+
+    def _set_busy(self, busy: bool) -> None:
+        self.code_input.setEnabled(not busy)
+        self.browse_btn.setEnabled(not busy)
+        self.start_btn.setEnabled(not busy)
+        self.busy_changed.emit(busy)
+
+    def _open_dir(self) -> None:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(self._output_dir))
+
+    def _cancel(self) -> None:
+        if self._worker is not None:
+            self._worker.cancel()
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(APP_NAME)
+        self.resize(680, 620)
+
+        self.tabs = QTabWidget()
+        self.send_tab = SendTab()
+        self.receive_tab = ReceiveTab()
+        self.tabs.addTab(self.send_tab, "发送")
+        self.tabs.addTab(self.receive_tab, "接收")
+        self.setCentralWidget(self.tabs)
+
+        self.send_tab.busy_changed.connect(self._on_busy_changed)
+        self.receive_tab.busy_changed.connect(self._on_busy_changed)
+
+        self._update_checker: Optional[UpdateChecker] = None
+        self._build_menu()
+        self._auto_check_updates()
+
+    def _on_busy_changed(self, _busy: bool) -> None:
+        busy = self.send_tab._worker is not None or self.receive_tab._worker is not None
+        self.tabs.tabBar().setEnabled(not busy)
+
+    def _build_menu(self) -> None:
+        help_menu = self.menuBar().addMenu("帮助")
+        check_action = help_menu.addAction("检查更新")
+        about_action = help_menu.addAction("关于 FlashDrop")
+        check_action.triggered.connect(self._check_updates_manual)
+        about_action.triggered.connect(self._show_about)
+
+    def closeEvent(self, event) -> None:
+        checker = self._update_checker
+        if checker is not None and checker.isRunning():
+            checker.wait(15000)
+        super().closeEvent(event)
+
+    def _start_update_check(self, silent: bool) -> None:
+        if self._update_checker is not None and self._update_checker.isRunning():
+            return
+        self._update_checker = UpdateChecker(self)
+        self._update_checker.result_ready.connect(
+            lambda has_update, latest, url: self._on_update_result(
+                has_update, latest, url, silent=silent
+            )
+        )
+        self._update_checker.start()
+
+    def _auto_check_updates(self) -> None:
+        self._start_update_check(silent=True)
+
+    def _check_updates_manual(self) -> None:
+        self._start_update_check(silent=False)
+
+    def _on_update_result(
+        self, has_update: bool, latest: str, url: str, silent: bool = False
+    ) -> None:
+        if has_update:
+            box = QMessageBox(self)
+            box.setWindowTitle(APP_NAME)
+            box.setIcon(QMessageBox.Icon.Information)
+            box.setText(f"发现新版本 {latest}")
+            box.setInformativeText(f"当前版本：{__version__}\n最新版本：{latest}")
+            open_button = box.addButton("打开下载页", QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("稍后", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            if box.clickedButton() is open_button and url:
+                QDesktopServices.openUrl(QUrl(url))
+        elif not silent:
+            QMessageBox.information(self, APP_NAME, "当前已是最新版本。")
+
+    def _show_about(self) -> None:
+        QMessageBox.about(
+            self,
+            APP_NAME,
+            f"即传 FlashDrop\n版本 {__version__}\n\n一个点对点传文件的桌面应用。",
+        )
+
+
+def main() -> int:
+    app = QApplication([])
+    app.setApplicationName(APP_NAME)
+    app.setStyleSheet(STYLESHEET)
+    window = MainWindow()
+    window.show()
+    return app.exec()
