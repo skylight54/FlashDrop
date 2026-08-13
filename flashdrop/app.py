@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import collections
 import os
 import sys
 from pathlib import Path
 from typing import List, Optional
 
-from PySide6.QtCore import Qt, QUrl, Signal
+from PySide6.QtCore import Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -18,15 +20,17 @@ from PySide6.QtWidgets import (
     QListWidget,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QStyle,
     QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
-from . import __version__
+from . import __version__, logger
 from .transfer import TransferWorker
 from .updater import UpdateChecker
 
@@ -75,75 +79,95 @@ def state_pixmap(state: str, size: int = 160):
 
 STYLESHEET = """
 QMainWindow, QWidget {
-    background: #f5f6f8;
-    color: #1f2329;
+    background: #FAF3E8;
+    color: #4A3420;
     font-size: 14px;
 }
 QLabel#tabTitle {
     font-size: 22px;
     font-weight: 700;
+    color: #3E2B1A;
 }
 QLabel#subtitle {
-    color: #6b7280;
+    color: #8A7358;
     font-size: 13px;
 }
 QLabel#codeValue {
     font-family: Consolas, "Courier New", monospace;
     font-size: 26px;
     font-weight: 700;
-    color: #2563eb;
-    background: #eef2ff;
-    border: 1px solid #c7d2fe;
-    border-radius: 6px;
+    color: #C96A16;
+    background: #FDEDD9;
+    border: 1px solid #F0C896;
+    border-radius: 8px;
     padding: 16px;
 }
-QListWidget, QLineEdit, QTextEdit {
-    background: #ffffff;
-    border: 1px solid #d9dce1;
-    border-radius: 6px;
+QFrame#transferPanel {
+    background: #FFFDF9;
+    border: 1px solid #EAD9BE;
+    border-radius: 10px;
+}
+QListWidget, QLineEdit, QTextEdit, QPlainTextEdit {
+    background: #FFFDF9;
+    border: 1px solid #EAD9BE;
+    border-radius: 8px;
     padding: 6px;
+    selection-background-color: #F6D9B4;
+    selection-color: #4A3420;
 }
 QListWidget::item {
     padding: 6px;
+    border-radius: 4px;
 }
 QListWidget::item:selected {
-    background: #eef2ff;
-    color: #1f2329;
+    background: #F6D9B4;
+    color: #4A3420;
 }
 QPushButton {
-    background: #ffffff;
-    border: 1px solid #d9dce1;
-    border-radius: 6px;
+    background: #FFFDF9;
+    border: 1px solid #EAD9BE;
+    border-radius: 8px;
     padding: 8px 14px;
+    color: #5C4126;
 }
 QPushButton:hover {
-    background: #f1f3f5;
+    background: #F6EBD8;
+    border-color: #E0C79E;
+}
+QPushButton:pressed {
+    background: #F0DFC2;
 }
 QPushButton:disabled {
-    color: #a1a8b0;
-    background: #f1f3f5;
+    color: #C2AE93;
+    background: #F5EDE0;
+    border-color: #EAD9BE;
 }
 QPushButton#primary {
-    background: #2563eb;
-    color: #ffffff;
+    background: #E0822D;
+    color: #FFFFFF;
     border: none;
     font-weight: 600;
 }
 QPushButton#primary:hover {
-    background: #1d4ed8;
+    background: #C96A16;
+}
+QPushButton#primary:pressed {
+    background: #B25E12;
 }
 QPushButton#primary:disabled {
-    background: #a5b8ee;
+    background: #E8C29A;
+    color: #FFF9F0;
 }
 QProgressBar {
     border: none;
-    background: #e5e7eb;
+    background: #EFE3D0;
     border-radius: 5px;
-    height: 8px;
+    height: 10px;
     text-align: center;
+    color: #4A3420;
 }
 QProgressBar::chunk {
-    background: #2563eb;
+    background: #E0822D;
     border-radius: 5px;
 }
 QTabWidget::pane {
@@ -152,11 +176,16 @@ QTabWidget::pane {
 QTabBar::tab {
     background: transparent;
     padding: 10px 22px;
-    color: #6b7280;
+    color: #8A7358;
+    border-bottom: 2px solid transparent;
+}
+QTabBar::tab:hover {
+    color: #4A3420;
 }
 QTabBar::tab:selected {
-    color: #2563eb;
-    border-bottom: 2px solid #2563eb;
+    color: #C96A16;
+    border-bottom: 2px solid #E0822D;
+    font-weight: 600;
 }
 """
 
@@ -170,6 +199,78 @@ def app_icon() -> QIcon:
     path = os.path.join(asset_dir(), "icon.ico")
     icon = QIcon(path)
     return icon if not icon.isNull() else QIcon()
+
+
+def _std_icon(name: str) -> QIcon:
+    """返回 QStyle 标准图标（如 SP_DirIcon），缺失时返回空图标。"""
+    standard = getattr(QStyle.StandardPixmap, name, None)
+    if standard is None:
+        return QIcon()
+    return QApplication.style().standardIcon(standard)
+
+
+class LogViewerDialog(QDialog):
+    """查看运行日志的对话框，自动刷新最近内容。"""
+
+    _TAIL_LINES = 5000
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("运行日志")
+        self.resize(760, 540)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        self.path_label = QLabel(f"日志文件：{logger.log_file() or '（日志文件未创建）'}")
+        self.path_label.setObjectName("subtitle")
+        self.path_label.setWordWrap(True)
+
+        self.view = QPlainTextEdit()
+        self.view.setReadOnly(True)
+        self.view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        font = self.view.font()
+        font.setPointSize(10)
+        self.view.setFont(font)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        refresh_btn = QPushButton("刷新")
+        open_dir_btn = QPushButton("打开日志文件夹")
+        close_btn = QPushButton("关闭")
+        for button in (refresh_btn, open_dir_btn, close_btn):
+            buttons.addWidget(button)
+
+        layout.addWidget(self.path_label)
+        layout.addWidget(self.view, 1)
+        layout.addLayout(buttons)
+
+        refresh_btn.clicked.connect(self._reload)
+        open_dir_btn.clicked.connect(self._open_dir)
+        close_btn.clicked.connect(self.accept)
+
+        self._reload()
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._reload)
+        self._timer.start(2000)
+
+    def _reload(self) -> None:
+        path = logger.log_file()
+        if not path or not os.path.exists(path):
+            self.view.setPlainText("（暂无日志）")
+            return
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                lines = collections.deque(fh, maxlen=self._TAIL_LINES)
+            self.view.setPlainText("".join(lines))
+        except OSError as exc:
+            self.view.setPlainText(f"读取日志失败：{exc}")
+
+    def _open_dir(self) -> None:
+        directory = logger.log_directory()
+        if directory and os.path.isdir(directory):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(directory))
 
 
 class StateImage(QLabel):
@@ -252,6 +353,9 @@ class SendTab(QWidget):
         self.add_dir_btn = QPushButton("添加文件夹")
         self.remove_btn = QPushButton("移除选中")
         self.clear_btn = QPushButton("清空")
+        self.add_files_btn.setIcon(_std_icon("SP_FileIcon"))
+        self.add_dir_btn.setIcon(_std_icon("SP_DirIcon"))
+        self.remove_btn.setIcon(_std_icon("SP_TrashIcon"))
         for button in (self.add_files_btn, self.add_dir_btn, self.remove_btn, self.clear_btn):
             file_buttons.addWidget(button)
 
@@ -439,6 +543,7 @@ class ReceiveTab(QWidget):
         self.dir_value = QLabel(self._output_dir)
         self.dir_value.setWordWrap(True)
         self.browse_btn = QPushButton("选择位置")
+        self.browse_btn.setIcon(_std_icon("SP_DirOpenIcon"))
         dir_row.addWidget(self.dir_value, 1)
         dir_row.addWidget(self.browse_btn)
 
@@ -448,6 +553,7 @@ class ReceiveTab(QWidget):
         self.panel = _TransferPanel()
         self.cancel_btn = QPushButton("取消")
         self.open_btn = QPushButton("打开接收位置")
+        self.open_btn.setIcon(_std_icon("SP_DirOpenIcon"))
         self.cancel_btn.hide()
         self.open_btn.hide()
         self.panel.hide()
@@ -582,10 +688,21 @@ class MainWindow(QMainWindow):
 
     def _build_menu(self) -> None:
         help_menu = self.menuBar().addMenu("帮助")
+        log_action = help_menu.addAction("查看日志")
         check_action = help_menu.addAction("检查更新")
         about_action = help_menu.addAction("关于 FlashDrop")
+        log_action.triggered.connect(self._show_logs)
         check_action.triggered.connect(self._check_updates_manual)
         about_action.triggered.connect(self._show_about)
+
+    def _show_logs(self) -> None:
+        dialog = getattr(self, "_log_dialog", None)
+        if dialog is None:
+            dialog = LogViewerDialog(self)
+            self._log_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     def closeEvent(self, event) -> None:
         checker = self._update_checker
@@ -640,6 +757,7 @@ def main() -> int:
     app.setApplicationName(APP_NAME)
     app.setWindowIcon(app_icon())
     app.setStyleSheet(STYLESHEET)
+    logger.setup_logging()
     window = MainWindow()
     window.show()
     return app.exec()

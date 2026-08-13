@@ -18,6 +18,7 @@
 - **发送**：选择文件或文件夹，生成暗号，把暗号发给对方。
 - **接收**：输入暗号，选择保存位置，直接接收。
 - **检查更新**：菜单「帮助 → 检查更新」自动查询 GitHub 最新发布版本，启动时也会静默检查。
+- **运行日志**：菜单「帮助 → 查看日志」实时查看传输状态、速度与耗时，便于排查问题。日志写入 `%LOCALAPPDATA%\FlashDrop\logs\`。
 
 ## 运行（开发环境）
 
@@ -39,6 +40,7 @@ flashdrop/
 ├── app.py        # 界面与交互逻辑（发送 / 接收 / 状态展示）
 ├── transfer.py   # 传输内核封装（后台线程运行 wormhole）
 ├── updater.py    # 检查更新（查询 GitHub Releases）
+├── logger.py     # 运行日志（写入本地文件，轮转）
 ├── __init__.py   # 包信息与版本号
 └── __main__.py   # python -m flashdrop 入口
 Asset/            # 状态图片（idle / wait / success / fail）与应用图标 icon.ico

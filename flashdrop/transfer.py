@@ -5,9 +5,12 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from typing import List, Optional
 
 from PySide6.QtCore import QThread, Signal
+
+from .logger import get_logger
 
 
 CODE_PATTERN = re.compile(r"Wormhole code is:\s*(\S+)")
@@ -15,7 +18,7 @@ RECEIVED_PATTERN = re.compile(r"Received file written to:\s*(.+?)\s*$")
 # tqdm 进度行形如 " 60%|████    | 120M/200M [00:00<00:00, 1.17GB/s]"
 PROGRESS_PATTERN = re.compile(r"(\d+)%")
 # tqdm 用 \r 原地刷新进度，因此需要同时按 \r\n / \r / \n 切分
-_LINE_SEP_RE = re.compile(r"\r\n|\r|\n")
+_LINE_SEP_RE = re.compile(rb"\r\n|\r|\n")
 
 
 def _creation_flags() -> int:
@@ -104,9 +107,12 @@ class TransferWorker(QThread):
             pass
 
     def run(self) -> None:
+        logger = get_logger()
+        started = time.monotonic()
         try:
             base = wormhole_command()
         except Exception as exc:
+            logger.error("启动失败：%s", exc)
             self.failed.emit(str(exc))
             return
 
@@ -117,32 +123,39 @@ class TransferWorker(QThread):
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
                 cwd=self._cwd,
                 creationflags=_creation_flags(),
             )
         except Exception as exc:
+            logger.error("无法启动传输进程：%s", exc)
             self.failed.emit(f"无法启动传输进程：{exc}")
             return
+
+        logger.info("启动传输进程: %s", " ".join(cmd))
 
         for line in self._iter_stderr_lines():
             line = line.strip()
             if not line:
                 continue
+            logger.debug("stderr: %s", line)
 
             code_match = CODE_PATTERN.search(line)
             if code_match:
-                self.code_ready.emit(code_match.group(1))
+                code = code_match.group(1)
+                logger.info("生成暗号: %s", code)
+                self.code_ready.emit(code)
 
             received_match = RECEIVED_PATTERN.search(line)
             if received_match:
                 self._received_path = received_match.group(1).strip()
+                logger.info("接收文件写入: %s", self._received_path)
 
             progress_match = PROGRESS_PATTERN.search(line)
             if progress_match:
-                self.progress.emit(int(progress_match.group(1)), _parse_progress_detail(line))
+                percent = int(progress_match.group(1))
+                detail = _parse_progress_detail(line)
+                logger.info("进度 %d%% %s", percent, detail)
+                self.progress.emit(percent, detail)
                 continue
 
             self._stderr_tail.append(line)
@@ -151,6 +164,7 @@ class TransferWorker(QThread):
             self.status.emit(line)
 
         retcode = self._proc.wait()
+        elapsed = time.monotonic() - started
 
         stdout = self._proc.stdout
         if stdout is not None:
@@ -160,17 +174,24 @@ class TransferWorker(QThread):
                 pass
 
         if self._cancelled:
+            logger.info("传输取消（耗时 %.1fs）", elapsed)
             self.cancelled.emit()
         elif retcode == 0:
+            logger.info("传输成功（耗时 %.1fs）", elapsed)
             self.succeeded.emit(self._received_path)
         else:
-            self.failed.emit(self._error_text() or f"传输失败（退出码 {retcode}）")
+            message = self._error_text() or f"传输失败（退出码 {retcode}）"
+            logger.error("传输失败（退出码 %d，耗时 %.1fs）：%s", retcode, elapsed, message)
+            self.failed.emit(message)
 
     def _iter_stderr_lines(self):
-        stream = self._proc.stderr
-        pending = ""
+        # 用 os.read 直接读原始 fd：read(n) 在文本模式下会阻塞到读满 n 字符或
+        # EOF，而 wormhole 打印完暗号后进程仍在等待接收方，EOF 迟迟不来，导致
+        # 暗号永远读不到。os.read 则一有数据就返回。
+        fd = self._proc.stderr.fileno()
+        pending = b""
         while True:
-            chunk = stream.read(4096)
+            chunk = os.read(fd, 4096)
             if not chunk:
                 break
             pending += chunk
@@ -178,10 +199,10 @@ class TransferWorker(QThread):
                 match = _LINE_SEP_RE.search(pending)
                 if match is None:
                     break
-                yield pending[: match.start()]
+                yield pending[: match.start()].decode("utf-8", "replace")
                 pending = pending[match.end():]
         if pending:
-            yield pending
+            yield pending.decode("utf-8", "replace")
 
     def _error_text(self) -> str:
         lines = [line for line in self._stderr_tail if line.strip()]
