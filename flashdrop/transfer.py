@@ -12,6 +12,10 @@ from PySide6.QtCore import QThread, Signal
 
 CODE_PATTERN = re.compile(r"Wormhole code is:\s*(\S+)")
 RECEIVED_PATTERN = re.compile(r"Received file written to:\s*(.+?)\s*$")
+# tqdm 进度行形如 " 60%|████    | 120M/200M [00:00<00:00, 1.17GB/s]"
+PROGRESS_PATTERN = re.compile(r"(\d+)%")
+# tqdm 用 \r 原地刷新进度，因此需要同时按 \r\n / \r / \n 切分
+_LINE_SEP_RE = re.compile(r"\r\n|\r|\n")
 
 
 def _creation_flags() -> int:
@@ -40,13 +44,31 @@ def wormhole_command() -> List[str]:
     raise RuntimeError("找不到 wormhole 命令，请先安装 magic-wormhole")
 
 
+def _parse_progress_detail(line: str) -> str:
+    """从 tqdm 进度行提取 "120M/200M · 1.17GB/s" 这类可读文本。"""
+    parts = line.split("|", 2)
+    if len(parts) < 3:
+        return ""
+    rest = parts[2].strip()
+    fraction = rest.split(" [", 1)[0].strip()
+    if not fraction:
+        return ""
+    rate_match = re.search(r",\s*([^\]]+)", rest)
+    rate = rate_match.group(1).strip() if rate_match else ""
+    if rate and rate not in ("?", "?B/s", "0.00B/s"):
+        return f"{fraction} · {rate}"
+    return fraction
+
+
 class TransferWorker(QThread):
     """在后台线程运行 wormhole CLI，并通过信号回传进度。"""
 
     code_ready = Signal(str)
     status = Signal(str)
+    progress = Signal(int, str)  # 百分比, 可读详情（如 "120M/200M · 1.17GB/s"）
     succeeded = Signal(str)
     failed = Signal(str)
+    cancelled = Signal()
 
     def __init__(self, args: List[str], cwd: Optional[str] = None, parent=None):
         super().__init__(parent)
@@ -59,12 +81,27 @@ class TransferWorker(QThread):
 
     def cancel(self) -> None:
         self._cancelled = True
+        self._kill_process_tree()
+
+    def _kill_process_tree(self) -> None:
+        """终止整个进程树。PyInstaller onefile 会派生子进程，只杀父进程会残留孤儿进程。"""
         proc = self._proc
-        if proc is not None and proc.poll() is None:
+        if proc is None or proc.poll() is not None:
+            return
+        if os.name == "nt":
             try:
-                proc.terminate()
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=_creation_flags(),
+                )
             except Exception:
                 pass
+        try:
+            proc.terminate()
+        except Exception:
+            pass
 
     def run(self) -> None:
         try:
@@ -83,7 +120,6 @@ class TransferWorker(QThread):
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                bufsize=1,
                 cwd=self._cwd,
                 creationflags=_creation_flags(),
             )
@@ -91,15 +127,10 @@ class TransferWorker(QThread):
             self.failed.emit(f"无法启动传输进程：{exc}")
             return
 
-        stderr = self._proc.stderr
-        assert stderr is not None
-        for raw in stderr:
-            line = raw.rstrip("\r\n")
+        for line in self._iter_stderr_lines():
+            line = line.strip()
             if not line:
                 continue
-            self._stderr_tail.append(line)
-            if len(self._stderr_tail) > 200:
-                self._stderr_tail = self._stderr_tail[-200:]
 
             code_match = CODE_PATTERN.search(line)
             if code_match:
@@ -109,6 +140,14 @@ class TransferWorker(QThread):
             if received_match:
                 self._received_path = received_match.group(1).strip()
 
+            progress_match = PROGRESS_PATTERN.search(line)
+            if progress_match:
+                self.progress.emit(int(progress_match.group(1)), _parse_progress_detail(line))
+                continue
+
+            self._stderr_tail.append(line)
+            if len(self._stderr_tail) > 200:
+                self._stderr_tail = self._stderr_tail[-200:]
             self.status.emit(line)
 
         retcode = self._proc.wait()
@@ -121,11 +160,28 @@ class TransferWorker(QThread):
                 pass
 
         if self._cancelled:
-            self.failed.emit("已取消")
+            self.cancelled.emit()
         elif retcode == 0:
             self.succeeded.emit(self._received_path)
         else:
             self.failed.emit(self._error_text() or f"传输失败（退出码 {retcode}）")
+
+    def _iter_stderr_lines(self):
+        stream = self._proc.stderr
+        pending = ""
+        while True:
+            chunk = stream.read(4096)
+            if not chunk:
+                break
+            pending += chunk
+            while True:
+                match = _LINE_SEP_RE.search(pending)
+                if match is None:
+                    break
+                yield pending[: match.start()]
+                pending = pending[match.end():]
+        if pending:
+            yield pending
 
     def _error_text(self) -> str:
         lines = [line for line in self._stderr_tail if line.strip()]

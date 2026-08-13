@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from PySide6.QtCore import Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QPixmap
+from PySide6.QtGui import QDesktopServices, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -165,6 +165,13 @@ def default_download_dir() -> str:
     return str(Path.home() / "Downloads")
 
 
+def app_icon() -> QIcon:
+    """返回应用图标（由 Asset/Idle.webp 生成）。"""
+    path = os.path.join(asset_dir(), "icon.ico")
+    icon = QIcon(path)
+    return icon if not icon.isNull() else QIcon()
+
+
 class StateImage(QLabel):
     """按传输状态显示对应图片的标签。"""
 
@@ -207,6 +214,12 @@ class _TransferPanel(QFrame):
     def clear(self) -> None:
         self.status_label.setText("")
         self.log.clear()
+        self.progress.setRange(0, 0)
+
+    def set_progress(self, percent: int) -> None:
+        if self.progress.maximum() == 0:
+            self.progress.setRange(0, 100)
+        self.progress.setValue(max(0, min(100, percent)))
 
 
 class SendTab(QWidget):
@@ -309,7 +322,7 @@ class SendTab(QWidget):
         if not self._files:
             QMessageBox.warning(self, APP_NAME, "请先选择要发送的文件或文件夹。")
             return
-        args = ["send", "--no-qr", "--hide-progress"] + self._files
+        args = ["send", "--no-qr"] + self._files
         self._begin_transfer(args, cwd=None)
 
     def _begin_transfer(self, args: List[str], cwd: Optional[str]) -> None:
@@ -328,10 +341,29 @@ class SendTab(QWidget):
         self._worker = TransferWorker(args, cwd=cwd, parent=self)
         self._worker.code_ready.connect(self._on_code_ready)
         self._worker.status.connect(self._on_status)
+        self._worker.progress.connect(self._on_progress)
         self._worker.succeeded.connect(self._on_succeeded)
         self._worker.failed.connect(self._on_failed)
+        self._worker.cancelled.connect(self._on_cancelled)
         self._worker.finished.connect(self._on_finished)
         self._worker.start()
+
+    def _on_progress(self, percent: int, detail: str) -> None:
+        self.panel.set_progress(percent)
+        text = f"发送中… {percent}%"
+        if detail:
+            text += f"（{detail}）"
+        self.panel.status_label.setText(text)
+
+    def _on_cancelled(self) -> None:
+        self.panel.status_label.setText("已取消。")
+        self.panel.progress.setRange(0, 1)
+        self.panel.progress.setValue(0)
+        self.state_image.set_state("idle")
+        self._code = ""
+        self.code_value.setText("")
+        self.code_value.hide()
+        self.copy_btn.hide()
 
     def _on_code_ready(self, code: str) -> None:
         self._code = code
@@ -453,7 +485,7 @@ class ReceiveTab(QWidget):
             QMessageBox.warning(self, APP_NAME, "请选择保存位置。")
             return
         os.makedirs(self._output_dir, exist_ok=True)
-        args = ["receive", "--accept-file", "--hide-progress", code]
+        args = ["receive", "--accept-file", code]
         self._begin_transfer(args, cwd=self._output_dir)
 
     def _begin_transfer(self, args: List[str], cwd: Optional[str]) -> None:
@@ -467,10 +499,25 @@ class ReceiveTab(QWidget):
 
         self._worker = TransferWorker(args, cwd=cwd, parent=self)
         self._worker.status.connect(self._on_status)
+        self._worker.progress.connect(self._on_progress)
         self._worker.succeeded.connect(self._on_succeeded)
         self._worker.failed.connect(self._on_failed)
+        self._worker.cancelled.connect(self._on_cancelled)
         self._worker.finished.connect(self._on_finished)
         self._worker.start()
+
+    def _on_progress(self, percent: int, detail: str) -> None:
+        self.panel.set_progress(percent)
+        text = f"接收中… {percent}%"
+        if detail:
+            text += f"（{detail}）"
+        self.panel.status_label.setText(text)
+
+    def _on_cancelled(self) -> None:
+        self.panel.status_label.setText("已取消，残留的临时文件可手动删除。")
+        self.panel.progress.setRange(0, 1)
+        self.panel.progress.setValue(0)
+        self.state_image.set_state("idle")
 
     def _on_status(self, text: str) -> None:
         self.panel.log.appendPlainText(text)
@@ -512,6 +559,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
+        self.setWindowIcon(app_icon())
         self.resize(680, 620)
 
         self.tabs = QTabWidget()
@@ -590,6 +638,7 @@ class MainWindow(QMainWindow):
 def main() -> int:
     app = QApplication([])
     app.setApplicationName(APP_NAME)
+    app.setWindowIcon(app_icon())
     app.setStyleSheet(STYLESHEET)
     window = MainWindow()
     window.show()

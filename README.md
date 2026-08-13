@@ -41,11 +41,12 @@ flashdrop/
 ├── updater.py    # 检查更新（查询 GitHub Releases）
 ├── __init__.py   # 包信息与版本号
 └── __main__.py   # python -m flashdrop 入口
-Asset/            # 状态图片（idle / wait / success / fail）
+Asset/            # 状态图片（idle / wait / success / fail）与应用图标 icon.ico
 main.py           # 程序入口
 wormhole_cli.py   # wormhole CLI 的薄封装，用于打包
 build.ps1         # PyInstaller 打包脚本
 tests/            # 冒烟测试
+tools/            # 辅助脚本（make_icon.py：从 Idle.webp 生成 icon.ico）
 ```
 
 ## 打包成可执行文件
